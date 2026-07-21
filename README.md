@@ -1,6 +1,8 @@
 # RGit
 
-Gitea(Go製)のRust版を目指す、自己ホスト型Git forge。
+GitbucketのGo言語版のRust＋RPoem版の新規開発を開始。自己ホスト型Git forge。
+
+**開発開始日: 2026-07-21**(このリポジトリのGitHub作成日)
 
 ## 現状(v0.1.0)
 

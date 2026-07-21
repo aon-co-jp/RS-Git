@@ -66,6 +66,13 @@ struct AppState {
     auth: Arc<auth::AuthStore>,
     admin_email: String,
     smtp: Option<mail::SmtpConfig>,
+    /// `true`の間、`admin_email`以外のメールアドレスを新規アカウント
+    /// (`POST /api/accounts`・自己申請の承認)として受け付けない
+    /// (ユーザー指示、2026-07-21:「norukia.jp@gmail.com以外のメール
+    /// アカウントは現状は受け入れないで」)。`RGIT_ACCOUNTS_LOCKED`
+    /// 環境変数(既定`true`)で制御、`false`にすれば従来通り誰でも
+    /// 自己申請→承認できる状態に戻せる。
+    accounts_locked: bool,
 }
 
 /// `Authorization`ヘッダからログイン中のメールアドレスを特定する。
@@ -638,6 +645,11 @@ async fn add_account(req: &Request, state: Data<&AppState>, body: poem::web::Jso
     if !email.contains('@') {
         return Ok(Response::builder().status(poem::http::StatusCode::BAD_REQUEST).body("invalid email"));
     }
+    if state.accounts_locked && email != state.admin_email {
+        return Ok(Response::builder()
+            .status(poem::http::StatusCode::FORBIDDEN)
+            .body("account registration is currently restricted to the administrator email only"));
+    }
     let mut store = accounts::load(&state.repos_root).await;
     store.emails.insert(email);
     accounts::save(&state.repos_root, &store)
@@ -757,6 +769,17 @@ async fn decide_access_request(
         return Ok(Response::builder().status(poem::http::StatusCode::NOT_FOUND).body("request not found"));
     };
     let request = store.pending_requests.remove(pos);
+
+    if body.approve && state.accounts_locked && request.email != state.admin_email {
+        // 申請自体は削除済みだが、まだ`emails`へは登録していない状態で
+        // 保存し直す(却下と同じ扱い)。管理者へは理由を明示して返す。
+        accounts::save(&state.repos_root, &store)
+            .await
+            .map_err(|e| poem::Error::from_string(e.to_string(), poem::http::StatusCode::INTERNAL_SERVER_ERROR))?;
+        return Ok(Response::builder()
+            .status(poem::http::StatusCode::FORBIDDEN)
+            .body("account registration is currently restricted to the administrator email only"));
+    }
 
     if body.approve {
         store.emails.insert(request.email.clone());
@@ -1039,7 +1062,11 @@ async fn main() -> anyhow::Result<()> {
     if smtp.is_none() {
         tracing::warn!("RGIT_SMTP_* not fully configured; /api/auth/request-otp will return 503");
     }
-    let state = AppState { repos_root, auth: Arc::new(auth::AuthStore::default()), admin_email, smtp };
+    let accounts_locked = std::env::var("RGIT_ACCOUNTS_LOCKED").map(|v| v != "false" && v != "0").unwrap_or(true);
+    if accounts_locked {
+        tracing::info!("account registration is locked to the admin email only (RGIT_ACCOUNTS_LOCKED=false to lift)");
+    }
+    let state = AppState { repos_root, auth: Arc::new(auth::AuthStore::default()), admin_email, smtp, accounts_locked };
 
     // git smart HTTPの実際のURLパターン(`git clone http://host/repo.git`)は
     // `/{repo}.git/info/refs`・`/{repo}.git/git-upload-pack`・
