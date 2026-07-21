@@ -7,11 +7,15 @@
 //! **v0.1.0時点では、git smart HTTPプロトコルによるclone/push/fetchのみ**
 //! を実装している。GitBucket/Giteaが持つ以下の機能は**まだ一切無い**:
 //!
-//! - Web UI(リポジトリ閲覧・diffの整形表示等)
+//! - Web UI(リポジトリ閲覧・diffの整形表示等) — README表示のみ実装済み
 //! - Issue・Pull Request
 //! - Wiki
-//! - ユーザー管理・認証(現状は誰でも読み書き可能、REMOTE_USERは固定値)
+//! - git smart HTTP経由のclone/push自体への認証(`REMOTE_USER`は固定値の
+//!   まま) — Web UI操作(リポジトリ新規作成)のみ[`auth`]モジュールで
+//!   OTPログインを要求する(2026-07-21、[open-easy-web]と同じ設計)
 //! - Webhook
+//!
+//! [open-easy-web]: https://github.com/aon-co-jp/open-easy-web
 //!
 //! 実装済みなのは「`git clone`/`git push`が実際に成功する」という
 //! 最小限のGitサーバー機能のみ。`git http-backend`(gitに標準同梱される
@@ -20,23 +24,42 @@
 //! 橋渡しするだけで、Gitプロトコル自体の再実装は行っていない
 //! (実装難易度と実績のバランスを取った判断)。
 
+mod auth;
+mod mail;
+
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 
 use poem::listener::TcpListener;
 use poem::middleware::Tracing;
 use poem::web::Data;
 use poem::{
-    handler, get, put,
+    handler, get, post, put,
     web::Path as PathExtractor,
     Body, EndpointExt, Request, Response, Result as PoemResult, Route, Server,
 };
+use serde::Deserialize;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 #[derive(Clone)]
 struct AppState {
     repos_root: PathBuf,
+    auth: Arc<auth::AuthStore>,
+    admin_email: String,
+    smtp: Option<mail::SmtpConfig>,
+}
+
+/// `Authorization: Bearer <token>`ヘッダから有効なセッショントークンを
+/// 検証する。無効なら`401`エラーを返す。
+fn require_session(req: &Request, state: &AppState) -> PoemResult<()> {
+    let header = req.header(poem::http::header::AUTHORIZATION).unwrap_or("");
+    let token = header.strip_prefix("Bearer ").unwrap_or("");
+    if token.is_empty() || !state.auth.is_valid(token) {
+        return Err(poem::Error::from_string("not logged in", poem::http::StatusCode::UNAUTHORIZED));
+    }
+    Ok(())
 }
 
 fn env_data_dir() -> PathBuf {
@@ -133,10 +156,66 @@ async fn get_readme(PathExtractor(name): PathExtractor<String>, state: Data<&App
         .body(serde_json::to_vec(&payload).unwrap_or_default()))
 }
 
-/// `PUT /repos/:name` — bareリポジトリを新規作成する(`git init --bare`)。
-/// 既に存在する場合は`409 Conflict`を返す。
+/// `POST /api/auth/request-otp` — 固定管理者メール宛にOTPを送信する。
+/// SMTP未設定の場合は`503`を返す(open-easy-webと同じグレースフル
+/// デグレード方針)。
 #[handler]
-async fn create_repo(PathExtractor(name): PathExtractor<String>, state: Data<&AppState>) -> PoemResult<Response> {
+async fn request_otp(state: Data<&AppState>) -> PoemResult<Response> {
+    let Some(smtp) = state.smtp.clone() else {
+        return Ok(Response::builder().status(poem::http::StatusCode::SERVICE_UNAVAILABLE).body("SMTP not configured"));
+    };
+    let auth::RequestOtpOutcome::Issued(code) = state.auth.request_otp(&state.admin_email);
+    match mail::send_otp(smtp, state.admin_email.clone(), code).await {
+        Ok(()) => Ok(Response::builder().status(poem::http::StatusCode::OK).body("otp sent")),
+        Err(e) => {
+            tracing::warn!("failed to send OTP mail: {e}");
+            Ok(Response::builder().status(poem::http::StatusCode::BAD_GATEWAY).body("failed to send mail"))
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct VerifyOtpRequest {
+    code: String,
+}
+
+#[derive(serde::Serialize)]
+struct VerifyOtpResponse {
+    token: String,
+}
+
+/// `POST /api/auth/verify-otp` — OTPコードを検証し、成功すればセッション
+/// トークンを発行する。
+#[handler]
+async fn verify_otp(state: Data<&AppState>, body: poem::web::Json<VerifyOtpRequest>) -> PoemResult<Response> {
+    match state.auth.consume_otp(&state.admin_email, &body.code) {
+        Ok(()) => {
+            let token = state.auth.create_session();
+            Ok(Response::builder()
+                .status(poem::http::StatusCode::OK)
+                .content_type("application/json")
+                .body(serde_json::to_vec(&VerifyOtpResponse { token }).unwrap_or_default()))
+        }
+        Err(e) => Ok(Response::builder().status(poem::http::StatusCode::FORBIDDEN).body(e.message())),
+    }
+}
+
+/// `POST /api/auth/logout` — セッショントークンを失効させる。
+#[handler]
+async fn logout(req: &Request, state: Data<&AppState>) -> PoemResult<Response> {
+    let header = req.header(poem::http::header::AUTHORIZATION).unwrap_or("");
+    if let Some(token) = header.strip_prefix("Bearer ") {
+        state.auth.logout(token);
+    }
+    Ok(Response::builder().status(poem::http::StatusCode::OK).body("logged out"))
+}
+
+/// `PUT /repos/:name` — bareリポジトリを新規作成する(`git init --bare`)。
+/// ログイン必須(`Authorization: Bearer <token>`)。既に存在する場合は
+/// `409 Conflict`を返す。
+#[handler]
+async fn create_repo(req: &Request, PathExtractor(name): PathExtractor<String>, state: Data<&AppState>) -> PoemResult<Response> {
+    require_session(req, &state)?;
     let repo_dir_name = sanitize_repo_name(&name)?;
     let repo_path = state.repos_root.join(&repo_dir_name);
     if repo_path.exists() {
@@ -270,7 +349,12 @@ async fn main() -> anyhow::Result<()> {
     tokio::fs::create_dir_all(&repos_root).await?;
     tracing::info!("rgit v0.1.0 starting, repos_root={:?}", repos_root);
 
-    let state = AppState { repos_root };
+    let admin_email = std::env::var("RGIT_ADMIN_EMAIL").unwrap_or_else(|_| "admin@example.com".to_string());
+    let smtp = mail::SmtpConfig::from_env();
+    if smtp.is_none() {
+        tracing::warn!("RGIT_SMTP_* not fully configured; /api/auth/request-otp will return 503");
+    }
+    let state = AppState { repos_root, auth: Arc::new(auth::AuthStore::default()), admin_email, smtp };
 
     // git smart HTTPの実際のURLパターン(`git clone http://host/repo.git`)は
     // `/{repo}.git/info/refs`・`/{repo}.git/git-upload-pack`・
@@ -284,6 +368,9 @@ async fn main() -> anyhow::Result<()> {
         .at("/repos/:name", put(create_repo))
         .at("/api/repos", get(list_repos))
         .at("/api/repos/:name/readme", get(get_readme))
+        .at("/api/auth/request-otp", post(request_otp))
+        .at("/api/auth/verify-otp", post(verify_otp))
+        .at("/api/auth/logout", post(logout))
         .nest(
             "/ui",
             poem::endpoint::StaticFilesEndpoint::new(&static_dir).index_file("index.html"),

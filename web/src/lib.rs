@@ -9,18 +9,20 @@
 //! バイナリサイズへの影響が大きいため使わない。JSONパースも当初は
 //! ブラウザ組み込みの`JSON.parse`(`js_sys::JSON`)へ委譲する案だったが、
 //! それだと`Reflect::get`でフィールドを読むたびにWASM↔JS境界を1回ずつ
-//! 跨ぐ。このプロジェクトが受け取るJSONは`/api/repos`・
-//! `/api/repos/:name/readme`の2種類のみで構造が単純なため、
-//! 自作の最小JSONパーサ([`rjson`])で1回パースし、以降はネイティブRust値
+//! 跨ぐ。以前はこのクレート内に自作の最小JSONパーサを持っていたが、
+//! [aon-co-jp/RJSON](https://github.com/aon-co-jp/RJSON)(`rust-json`
+//! クレート)の`light`モジュールへ統合した(2026-07-21)——依存ゼロの
+//! ブラウザ`JSON.parse`相当を1回パースし、以降はネイティブRust値
 //! (`String`/`Vec`)として扱う——境界越えの呼び出し回数そのものを削減する。
+//! `rust-json`は`default-features = false`(`Cargo.toml`参照)で依存し、
+//! `serde_json`を要求する`full` featureはビルド対象に含まれない。
 //! 加えて`opt-level="z"`+LTO+`panic=abort`+`strip=true`
 //! (`Cargo.toml`参照)でバイナリを極小化している。
 //!
 //! **正直な開示**: v0.1.0はリポジトリ一覧+README表示のみ。GitHubにある
 //! ディレクトリツリー表示・コミット履歴・シンタックスハイライト等は未実装。
 
-mod rjson;
-
+use rust_json::{parse_light, LightValue};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
@@ -51,17 +53,19 @@ fn show_status(msg: &str) {
     }
 }
 
-/// [`rjson`](自作の最小JSONパーサ)で文字列配列をパースする。
+/// `rust_json::parse_light`(RJSONの`light`モジュール)で文字列配列を
+/// パースする。
 fn parse_string_array(text: &str) -> Vec<String> {
-    let Ok(value) = rjson::parse(text) else { return Vec::new() };
+    let Ok(value) = parse_light(text) else { return Vec::new() };
     let Some(items) = value.as_array() else { return Vec::new() };
-    items.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()
+    items.iter().filter_map(LightValue::as_str).map(str::to_string).collect()
 }
 
-/// `{"branch": "...", "content": "..."}`から2フィールドを[`rjson`]で
-/// 直接読む(型を作らず、必要な2値だけをその場で取り出す)。
+/// `{"branch": "...", "content": "..."}`から2フィールドを
+/// `rust_json::parse_light`で直接読む(型を作らず、必要な2値だけを
+/// その場で取り出す)。
 fn parse_readme_fields(text: &str) -> Option<(String, String)> {
-    let value = rjson::parse(text).ok()?;
+    let value = parse_light(text).ok()?;
     let branch = value.get("branch")?.as_str()?.to_string();
     let content = value.get("content")?.as_str()?.to_string();
     Some((branch, content))

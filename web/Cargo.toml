@@ -11,10 +11,13 @@ crate-type = ["cdylib"]
 [dependencies]
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
-# serde/serde_json/js_sys::JSONはあえて使わない。JSONパースは自作の最小
-# パーサ(src/rjson.rs)で行い、WASM↔JS境界を跨ぐ呼び出し回数と依存する
-# クレート数の両方を削減する(詳細はsrc/lib.rsのモジュールdoc参照)。
-pulldown-cmark = { version = "0.12", default-features = false }
+# serde/serde_json/js_sys::JSONはあえて使わない。JSONパースは
+# aon-co-jp/RJSON(rust-jsonクレート)のlightモジュール(依存ゼロ、
+# ブラウザJSON.parse相当)に一本化した(2026-07-21、旧・独自実装の
+# web/src/rjson.rsは撤去)。RGitと同じ`F:\runo`配下のsibling repoである
+# 前提のpath依存(詳細はsrc/lib.rsのモジュールdoc参照)。
+rust-json = { path = "../../RJSON", default-features = false }
+pulldown-cmark = { version = "0.12", default-features = false, features = ["html"] }
 
 [dependencies.web-sys]
 version = "0.3"
@@ -24,6 +27,7 @@ features = [
     "Element",
     "HtmlElement",
     "Node",
+    "Event",
     "Response",
     "Request",
     "RequestInit",

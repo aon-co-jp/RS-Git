@@ -84,3 +84,41 @@ CGIプログラム)をサブプロセスとして起動し、HTTPリクエスト
 > ホスト名・トークン等)は、このリポジトリを含むいかなるGitリポジトリの
 > コミット・ドキュメントにも記載しない。関連設定はVPS上の環境変数・
 > 認証情報ファイル(`/root/.secrets/`等)のみで管理する。
+
+- **2026-07-21(続き) WASM実ビルド検証・[RJSON](https://github.com/aon-co-jp/RJSON)への
+  JSONパーサ統合・open-easy-web方式のOTP認証を追加**:
+  1. **WASM実ビルド・実機検証完了**: `cargo build --target
+     wasm32-unknown-unknown --release`成功、`wasm-bindgen`でJSグルー
+     生成、`.wasm`は234KB。実際に`rgit`サーバーを起動しリポジトリを
+     push、`/api/repos`・`/api/repos/:name/readme`のJSON応答を確認。
+  2. **`web/src/rjson.rs`(独自最小JSONパーサ)を撤去し、
+     [aon-co-jp/RJSON](https://github.com/aon-co-jp/RJSON)(`rust-json`
+     クレート)の`light`モジュールへ統合**(ユーザー指示「統廃合して
+     融合して」)。RJSON側に`serde_json`依存ゼロの`light`モジュールを
+     新設してもらい(`full` featureで既存のserde_json依存コードと分離、
+     `default-features = false`で完全排除可能)、`web/Cargo.toml`で
+     `rust-json = { path = "../../RJSON", default-features = false }`
+     として依存。旧`web/src/rjson.rs`は削除、`lib.rs`は
+     `rust_json::{parse_light, LightValue}`を使うよう書き換え。
+     ビルド後の`.wasm`サイズは234KBのまま(serde_json非混入を確認済み)。
+  3. **open-easy-webと同じOTP認証を追加**(ユーザー承認: フル実装、
+     SMTP設定込み): `src/auth.rs`(open-easy-webの`server/src/auth.rs`
+     から、RGitは単一管理者アカウントのみのため`UserStore`相当・
+     連絡先変更機能を省いて移植)・`src/mail.rs`(同`mail.rs`から
+     `send_otp`のみ移植、`lettre`)。`RGIT_ADMIN_EMAIL`・
+     `RGIT_SMTP_{HOST,PORT,USERNAME,PASSWORD,FROM}`環境変数で設定。
+     `POST /api/auth/{request-otp,verify-otp,logout}`、
+     `PUT /repos/:name`(リポジトリ新規作成)に`Authorization: Bearer`
+     必須化(`require_session`)。**実SMTP(既存open-easy-webと同じGmail
+     アカウントを再利用)で実際にOTPメールを送受信し、
+     未ログイン→401・OTP送信→200・OTP検証→トークン発行→
+     トークン付き作成→201・無効トークン→401・ログアウト後の同一
+     トークン→401という一連のフローを実HTTPで確認済み**(モックでは
+     なく実メール到達・実コード入力による検証)。
+     `cargo test`—auth関連5件green。
+  - 次にすべきこと: (1) WASMフロントエンド側にログインUI(メール
+    OTP入力フォーム)がまだ無い(現状はcurlでの検証のみ、サーバー側
+    APIは完成)、(2) git smart HTTP(clone/push)自体への認証は未着手
+    (現状はWeb UI操作のみ保護、モジュールdoc参照)、(3) VPSへの
+    再デプロイ(認証・RJSON統合を反映した最新版)、(4) 保留中の
+    外部バックアップ同期スクリプトへの組み込み。
