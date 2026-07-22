@@ -1,6 +1,6 @@
 # RGit
 
-GitbucketのGo言語版のRust＋RPoem版の新規開発を開始。自己ホスト型Git forge。
+Giteaが持つ機能のうち、まずgit clone/push・OTPログイン・アクセス制御・README閲覧機能だけを実装した、Go言語版GiteaのRust＋RPoem版です。元の機能を素直に移植致しました。自己ホスト型Git forge。
 
 **開発開始日: 2026-07-21**(このリポジトリのGitHub作成日)
 
