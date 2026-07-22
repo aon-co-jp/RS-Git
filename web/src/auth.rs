@@ -25,7 +25,7 @@ const EMAIL_KEY: &str = "rgit_email";
 /// おり、複数のマウント先(例: 別ドメイン・別パス)で同じビルドを使い
 /// 回すことは想定していない——将来必要になれば、ビルド時環境変数や
 /// `index.html`側の設定注入に置き換えること。
-const BASE_PATH: &str = "/rgit";
+const BASE_PATH: &str = "/rs-git";
 
 pub fn api_url(path: &str) -> String {
     format!("{BASE_PATH}{path}")

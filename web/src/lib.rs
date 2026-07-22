@@ -36,7 +36,7 @@ fn document() -> Document {
     web_sys::window().expect("no window").document().expect("no document")
 }
 
-/// `auth::api_url`と同じ接頭辞規約(`/rgit`マウント、モジュールdoc参照)。
+/// `auth::api_url`と同じ接頭辞規約(`/rs-git`マウント、モジュールdoc参照)。
 pub(crate) async fn fetch_text(url: &str) -> Result<String, JsValue> {
     let window = web_sys::window().ok_or_else(|| JsValue::from_str("no window"))?;
     let resp_value = JsFuture::from(window.fetch_with_str(&auth::api_url(url))).await?;

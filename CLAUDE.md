@@ -1,4 +1,4 @@
-# 開発方針＆開発環境ルール(RGit)
+# 開発方針＆開発環境ルール(RS-Git)
 
 作業ドライブは`F:\runo`。この節は[`open-raid-z`](https://github.com/aon-co-jp/open-raid-z)の
 `CLAUDE.md`を正本とし、各プロジェクトへコピーして同期する方針に準じる。
@@ -457,6 +457,53 @@ CGIプログラム)をサブプロセスとして起動し、HTTPリクエスト
     (2) 実SMTP環境でのフルE2E(ログイン・申請承認・グループ管理含む)、
     (3) 保留中の外部バックアップ同期スクリプトへのRGit組み込み。
 ---
+
+- **2026-07-22(続き) `RGit`→`RS-Git`へリネーム完了(GitHub・ローカル・VPS)**:
+  ユーザー指示によりGitHub側`gh repo rename`で`aon-co-jp/RGit`→
+  `aon-co-jp/RS-Git`(旧URLは301リダイレクト)。ローカル`F:\runo\RGit`も
+  `F:\runo\RS-Git`へリネーム済み、`git remote`も更新済み。
+  1. **VPS側対応**: `/root/RGit`→`/root/RS-Git`へ`mv`(サービス停止後、
+     ロック無し確認済み)。systemdサービス`rgit.service`を新規
+     `rs-git.service`として再作成(`WorkingDirectory`/`ExecStart`を
+     `/root/RS-Git`へ、`Description`も`RS-Git - self-hosted git forge
+     (Rust)`へ更新)、旧`rgit.service`は`disable`後にバックアップ退避
+     して削除、`daemon-reload`→`rs-git`を`enable --now`。
+     `systemctl status rs-git`で`active (running)`、
+     `curl 127.0.0.1:8090/ui/`・`/api/repos`とも`200`を確認。
+  2. **nginx**: `/etc/nginx/conf.d/runo-tokyo-tls.conf`の`/rgit`関連
+     locationを`/rs-git`へ更新しつつ、後方互換のため`/rgit`→`/rs-git`
+     への301リダイレクト(正規表現location`^/rgit/(.*)$`含む)を追加
+     残置。`nginx -t`で構文検証後`reload`。実機`curl`で
+     `https://runo.tokyo/rs-git/ui/`→`200`、
+     `https://runo.tokyo/rgit/`・`/rgit`・`/rgit/api/repos`いずれも
+     `https://runo.tokyo/rs-git/...`へ`301`リダイレクトされることを確認。
+  3. **WASMフロントエンドのBASE_PATH修正(重要)**: `web/src/auth.rs`の
+     `BASE_PATH`定数がハードコードで`"/rgit"`だったため、nginxパス変更
+     だけでは絶対パスfetchが壊れる。`"/rs-git"`へ修正し、
+     `cargo build --target wasm32-unknown-unknown --release`→
+     `wasm-bindgen --target web --no-typescript --out-dir static`で
+     再生成(`.wasm`更新)。`cargo test`(サーバー本体)20件全green、
+     `web/`側もwarning無しでビルド成功。
+  4. **UI文言更新**: `static/index.html`の`<title>`・見出し・
+     GitHubリンク(`releases/latest`・ソース)を`RS-Git`へ更新、
+     「旧名RGit、2026-07-22にRS-Gitへ改名」の注記を追加。
+  5. **RS-Sync紹介を追加(ユーザー指示「rs-syncはRS-Gitのサイトでも
+     一緒に使うように紹介して」)**: `#intro`セクションに
+     [RS-Sync](https://runo.tokyo/rs-sync/)への案内リンク・簡単な
+     紹介文を追加(GitHub/RS-Git/Gitea/Gitbucket間のバックアップ同期
+     ツールである旨)。
+  6. **エコシステム内の参照更新**: `open-raid-z/CLAUDE.md`(関連
+     プロジェクト節)・`rs-sync`(CLAUDE.md/README.md/Cargo.toml)・
+     `runo.tokyo`(`src/lib.rs`/`src/meta_index.rs`、TOPページの
+     `/rs-git`リンク・メタ索引)・その他`aruaru-db`/`open-cuda`/
+     `open-web-server`/`RPoem`/`RS-Blog`/`RS-Chiketto`/`RS-EC`の
+     `CLAUDE.md`/`PORTING.md`内の現在形の`RGit`表記を`RS-Git`へ
+     更新(過去の経緯を語るHANDOFFログ本文中の当時の名称は維持)。
+  - 次にすべきこと: (1) ブラウザでの`https://runo.tokyo/rs-git/ui/`
+    実クリック確認(ログイン・README・Wiki表示、今回はcurlでの
+    ステータス確認のみ)、(2) Gitea/GitBucketが持つIssue・Pull
+    Request・Webhookは引き続き未実装、(3) 保留中の外部バックアップ
+    同期スクリプト自体の`/root/sync-repos.sh`統合可否判断。
 
 - **2026-07-22 Wiki機能を実装(Gitea/GitBucketが持つ未実装4機能のうち
   最も現実的だったもの)、実機・実git検証済み**:
