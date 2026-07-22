@@ -24,6 +24,7 @@
 
 mod admin;
 mod auth;
+mod wiki;
 
 use rust_json::{parse_light, LightValue};
 use wasm_bindgen::prelude::*;
@@ -36,7 +37,7 @@ fn document() -> Document {
 }
 
 /// `auth::api_url`と同じ接頭辞規約(`/rgit`マウント、モジュールdoc参照)。
-async fn fetch_text(url: &str) -> Result<String, JsValue> {
+pub(crate) async fn fetch_text(url: &str) -> Result<String, JsValue> {
     let window = web_sys::window().ok_or_else(|| JsValue::from_str("no window"))?;
     let resp_value = JsFuture::from(window.fetch_with_str(&auth::api_url(url))).await?;
     let resp: web_sys::Response = resp_value.dyn_into()?;
@@ -44,7 +45,7 @@ async fn fetch_text(url: &str) -> Result<String, JsValue> {
     Ok(text_value.as_string().unwrap_or_default())
 }
 
-fn markdown_to_html(src: &str) -> String {
+pub(crate) fn markdown_to_html(src: &str) -> String {
     let parser = pulldown_cmark::Parser::new(src);
     let mut html_out = String::new();
     pulldown_cmark::html::push_html(&mut html_out, parser);
@@ -77,6 +78,7 @@ fn parse_readme_fields(text: &str) -> Option<(String, String)> {
 
 async fn load_readme(repo: String) {
     show_status(&format!("{repo} のREADMEを読み込み中..."));
+    wasm_bindgen_futures::spawn_local(wiki::load_wiki_list(repo.clone()));
     let url = format!("/api/repos/{repo}/readme");
     match fetch_text(&url).await {
         Ok(text) => match parse_readme_fields(&text) {

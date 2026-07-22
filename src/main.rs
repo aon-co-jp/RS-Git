@@ -9,8 +9,15 @@
 //!
 //! - Web UI(リポジトリ閲覧・diffの整形表示等) — README表示のみ実装済み
 //! - Issue・Pull Request
-//! - Wiki
 //! - Webhook
+//!
+//! **Wiki**は実装済み(2026-07-22)。GitHub/GitLab/Gitea同様、各リポジトリ
+//! `<name>.git`の兄弟として`<name>.wiki.git`というbareリポジトリを持つ
+//! だけの設計——Wikiページの実体はそのリポジトリ内の`.md`ファイルであり、
+//! 編集はWeb UIからではなく`git clone`/`git push`で行う(このリポジトリ
+//! 自体がまだWeb版ファイルエディタを持たないことと一貫させた判断)。
+//! アクセス制御は`<name>.git`本体と**同じ**[`access::AccessConfig`]を
+//! 共有する(Wiki専用の権限体系は持たない、閲覧=View/push=Push)。
 //!
 //! ## アクセス制御(2026-07-21、[open-easy-web]と同じOTP認証をベースに拡張)
 //!
@@ -209,6 +216,26 @@ fn sanitize_repo_name(name: &str) -> PoemResult<String> {
     }
 }
 
+/// `<name>.git`から兄弟Wikiリポジトリ`<name>.wiki.git`のディレクトリ名を
+/// 導出する。`repo_dir_name`は[`sanitize_repo_name`]済み(`.git`サフィックス
+/// 保証済み)であることが前提。
+fn wiki_dir_name(repo_dir_name: &str) -> String {
+    let base = repo_dir_name.strip_suffix(".git").unwrap_or(repo_dir_name);
+    format!("{base}.wiki.git")
+}
+
+/// git smart HTTP経路(`git_get`/`git_post`)向け——リクエストされた
+/// リポジトリディレクトリ名(`<name>.git`または`<name>.wiki.git`)から、
+/// アクセス制御設定([`access::AccessConfig`])をどのディレクトリから
+/// 読むべきかを解決する。Wikiは本体リポジトリと**同じ**権限を共有する
+/// ため、`<name>.wiki.git`は常に`<name>.git`側の設定を見る。
+fn access_config_dir(repo_dir_name: &str, repos_root: &Path) -> PathBuf {
+    match repo_dir_name.strip_suffix(".wiki.git") {
+        Some(base) => repos_root.join(format!("{base}.git")),
+        None => repos_root.join(repo_dir_name),
+    }
+}
+
 /// `GET /api/repos` — リポジトリ一覧。ログイン済みなら全リポジトリ、
 /// 未ログインなら[`access`]で閲覧許可(`public`または、提示された
 /// トークンに一致する`group`)されたリポジトリのみ返す。
@@ -230,6 +257,12 @@ async fn list_repos(req: &Request, state: Data<&AppState>) -> PoemResult<poem::w
         {
             if entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
                 if let Some(name) = entry.file_name().to_str() {
+                    // `<name>.wiki.git`はWikiの実体であり、通常のリポジトリ
+                    // 一覧には出さない(README表示等の対象ではないため、
+                    // 管理者から見ても紛らわしいだけ——admin判定より前に弾く)。
+                    if name.ends_with(".wiki.git") {
+                        continue;
+                    }
                     let allowed = is_admin || {
                         let config = access::load(&entry.path()).await;
                         access::is_allowed(&config, access::Need::View, &groups, token.as_deref(), identity.as_deref())
@@ -396,6 +429,118 @@ async fn get_readme(req: &Request, PathExtractor(name): PathExtractor<String>, s
 
     if !show_out.status.success() {
         return Ok(Response::builder().status(poem::http::StatusCode::NOT_FOUND).body("README.md not found in default branch"));
+    }
+
+    let content = String::from_utf8_lossy(&show_out.stdout).to_string();
+    let payload = ReadmeResponse { branch, content };
+    Ok(Response::builder()
+        .status(poem::http::StatusCode::OK)
+        .content_type("application/json")
+        .body(serde_json::to_vec(&payload).unwrap_or_default()))
+}
+
+/// `GET /api/repos/:name/wiki` — Wikiページ名の一覧(`<name>.wiki.git`の
+/// デフォルトブランチにあるファイルの`git ls-tree`)。アクセス権は本体
+/// リポジトリ`<name>.git`の[`access::Need::View`]と共有する。**Wikiリポジトリ
+/// にコミットが1つも無い場合(まだ誰も`git push`していない場合)はエラー
+/// ではなく空配列を返す**(要件通り、`PUT /repos/:name`で自動作成される
+/// 直後のWikiは常にこの状態のため)。
+#[handler]
+async fn get_wiki_pages(req: &Request, PathExtractor(name): PathExtractor<String>, state: Data<&AppState>) -> PoemResult<Response> {
+    let repo_dir_name = sanitize_repo_name(&name)?;
+    let repo_path = state.repos_root.join(&repo_dir_name);
+    if !repo_path.exists() {
+        return Ok(Response::builder().status(poem::http::StatusCode::NOT_FOUND).body("repository not found"));
+    }
+    check_access(req, &state, &repo_path, access::Need::View).await?;
+
+    let wiki_path = state.repos_root.join(wiki_dir_name(&repo_dir_name));
+    if !wiki_path.exists() {
+        return Ok(Response::builder()
+            .status(poem::http::StatusCode::OK)
+            .content_type("application/json")
+            .body(serde_json::to_vec::<Vec<String>>(&Vec::new()).unwrap_or_default()));
+    }
+
+    let branch = resolve_default_branch(&wiki_path).await?;
+    if branch.is_empty() {
+        return Ok(Response::builder()
+            .status(poem::http::StatusCode::OK)
+            .content_type("application/json")
+            .body(serde_json::to_vec::<Vec<String>>(&Vec::new()).unwrap_or_default()));
+    }
+
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(&wiki_path)
+        .arg("ls-tree")
+        .arg("-r")
+        .arg("--name-only")
+        .arg(&branch)
+        .output()
+        .await
+        .map_err(|e| poem::Error::from_string(e.to_string(), poem::http::StatusCode::INTERNAL_SERVER_ERROR))?;
+    if !out.status.success() {
+        // `symbolic-ref`はHEADが指す**ブランチ名**を返すだけで、その
+        // ブランチが実在する(コミットがある)かは保証しない
+        // (bareリポジトリ作成直後はHEADが`refs/heads/master`等を指す
+        // ものの、コミットは0個)。この場合`ls-tree`は失敗するが、
+        // それも「まだページが無い」という正常な状態として扱う
+        // (要件通り、エラーではなく空配列)。
+        return Ok(Response::builder()
+            .status(poem::http::StatusCode::OK)
+            .content_type("application/json")
+            .body(serde_json::to_vec::<Vec<String>>(&Vec::new()).unwrap_or_default()));
+    }
+    let files: Vec<&str> = std::str::from_utf8(&out.stdout).unwrap_or("").lines().collect();
+    Ok(Response::builder()
+        .status(poem::http::StatusCode::OK)
+        .content_type("application/json")
+        .body(serde_json::to_vec(&files).unwrap_or_default()))
+}
+
+/// `GET /api/repos/:name/wiki/:page` — Wikiの1ページの中身を返す
+/// (`git show <branch>:<page>`、README表示と同じ「gitコマンドに任せる」
+/// 方針)。`page`はツリー内のファイル名そのもの(通常は`Home.md`等)。
+#[handler]
+async fn get_wiki_page(
+    req: &Request,
+    PathExtractor((name, page)): PathExtractor<(String, String)>,
+    state: Data<&AppState>,
+) -> PoemResult<Response> {
+    let repo_dir_name = sanitize_repo_name(&name)?;
+    let repo_path = state.repos_root.join(&repo_dir_name);
+    if !repo_path.exists() {
+        return Ok(Response::builder().status(poem::http::StatusCode::NOT_FOUND).body("repository not found"));
+    }
+    check_access(req, &state, &repo_path, access::Need::View).await?;
+
+    let page = urlencoding_decode(&page);
+    sanitize_tree_path(&page)?;
+    if page.is_empty() {
+        return Err(poem::Error::from_string("page name required", poem::http::StatusCode::BAD_REQUEST));
+    }
+
+    let wiki_path = state.repos_root.join(wiki_dir_name(&repo_dir_name));
+    if !wiki_path.exists() {
+        return Ok(Response::builder().status(poem::http::StatusCode::NOT_FOUND).body("wiki has no pages yet"));
+    }
+
+    let branch = resolve_default_branch(&wiki_path).await?;
+    if branch.is_empty() {
+        return Ok(Response::builder().status(poem::http::StatusCode::NOT_FOUND).body("wiki has no pages yet"));
+    }
+
+    let show_out = Command::new("git")
+        .arg("-C")
+        .arg(&wiki_path)
+        .arg("show")
+        .arg(format!("{branch}:{page}"))
+        .output()
+        .await
+        .map_err(|e| poem::Error::from_string(e.to_string(), poem::http::StatusCode::INTERNAL_SERVER_ERROR))?;
+    if !show_out.status.success() {
+        return Ok(Response::builder().status(poem::http::StatusCode::NOT_FOUND).body("wiki page not found"));
     }
 
     let content = String::from_utf8_lossy(&show_out.stdout).to_string();
@@ -921,6 +1066,24 @@ async fn create_repo(req: &Request, PathExtractor(name): PathExtractor<String>, 
     if !status.success() {
         return Err(poem::Error::from_string("git init --bare failed", poem::http::StatusCode::INTERNAL_SERVER_ERROR));
     }
+
+    // Wikiリポジトリを兄弟として自動作成する(要件5: 「enable wiki」の
+    // ような別ステップ無しに、作成直後から`git clone .../<name>.wiki.git`
+    // できる状態にする)。コミットは1つも無い空リポジトリのままで良く、
+    // 一覧・閲覧API側(get_wiki_pages/get_wiki_page)がその状態を
+    // エラーではなく「ページ0件」として扱う。
+    let wiki_path = state.repos_root.join(wiki_dir_name(&repo_dir_name));
+    let wiki_status = Command::new("git")
+        .arg("init")
+        .arg("--bare")
+        .arg(&wiki_path)
+        .status()
+        .await
+        .map_err(|e| poem::Error::from_string(format!("failed to spawn git init for wiki: {e}"), poem::http::StatusCode::INTERNAL_SERVER_ERROR))?;
+    if !wiki_status.success() {
+        tracing::warn!("git init --bare failed for wiki repo {:?}", wiki_path);
+    }
+
     Ok(Response::builder().status(poem::http::StatusCode::CREATED).body(repo_dir_name))
 }
 
@@ -1082,7 +1245,8 @@ async fn git_get(req: &Request, state: Data<&AppState>) -> PoemResult<Response> 
     if let Some((repo_dir, need)) = parse_git_repo_and_need(&path_info, &query_string) {
         let repo_path = state.repos_root.join(&repo_dir);
         if repo_path.exists() {
-            if let Some(err_resp) = git_access_error(req, &state, &repo_path, need).await {
+            let access_path = access_config_dir(&repo_dir, &state.repos_root);
+            if let Some(err_resp) = git_access_error(req, &state, &access_path, need).await {
                 return Ok(err_resp);
             }
         }
@@ -1098,7 +1262,8 @@ async fn git_post(req: &Request, body: Body, state: Data<&AppState>) -> PoemResu
     if let Some((repo_dir, need)) = parse_git_repo_and_need(&path_info, &query_string) {
         let repo_path = state.repos_root.join(&repo_dir);
         if repo_path.exists() {
-            if let Some(err_resp) = git_access_error(req, &state, &repo_path, need).await {
+            let access_path = access_config_dir(&repo_dir, &state.repos_root);
+            if let Some(err_resp) = git_access_error(req, &state, &access_path, need).await {
                 return Ok(err_resp);
             }
         }
@@ -1115,6 +1280,8 @@ fn build_routes(state: AppState, static_dir: &str) -> impl poem::Endpoint {
         .at("/repos/:name", put(create_repo))
         .at("/api/repos", get(list_repos))
         .at("/api/repos/:name/readme", get(get_readme))
+        .at("/api/repos/:name/wiki", get(get_wiki_pages))
+        .at("/api/repos/:name/wiki/:page", get(get_wiki_page))
         .at("/api/repos/:name/access", get(get_access).put(set_access))
         .at("/api/repos/:name/tree", get(get_tree))
         .at("/api/repos/:name/zip", get(get_zip))
@@ -1236,5 +1403,204 @@ mod handler_tests {
 
         let resp = client.get("/api/accounts/member@example.com").send().await;
         resp.assert_status(poem::http::StatusCode::UNAUTHORIZED);
+    }
+
+    // --- Wiki機能(2026-07-22追記) ---
+
+    /// `PUT /repos/:name`実行時、本体`<name>.git`だけでなく兄弟の
+    /// `<name>.wiki.git`(空のbareリポジトリ)も自動作成されることを確認。
+    #[tokio::test]
+    async fn create_repo_also_creates_wiki_sibling() {
+        let state = make_state("create-repo-wiki").await;
+        let repos_root = state.repos_root.clone();
+        let token = state.auth.create_session(ADMIN_EMAIL);
+        let app = build_routes(state, "./static");
+        let client = TestClient::new(app);
+
+        let resp = client
+            .put("/repos/demo")
+            .header("Authorization", format!("Bearer {token}"))
+            .send()
+            .await;
+        resp.assert_status(poem::http::StatusCode::CREATED);
+
+        assert!(repos_root.join("demo.git").is_dir(), "main bare repo should exist");
+        assert!(repos_root.join("demo.wiki.git").is_dir(), "wiki bare repo should exist alongside it");
+
+        // 空リポジトリ(コミット無し)なので、一覧APIはエラーではなく
+        // 空配列を返す(要件通り)。
+        let wiki_resp = client
+            .get("/api/repos/demo/wiki")
+            .header("Authorization", format!("Bearer {token}"))
+            .send()
+            .await;
+        wiki_resp.assert_status_is_ok();
+        let body: serde_json::Value = serde_json::from_slice(&wiki_resp.0.into_body().into_bytes().await.unwrap()).unwrap();
+        assert_eq!(body, serde_json::json!([]));
+    }
+
+    async fn run_git(cwd: Option<&std::path::Path>, args: &[&str]) -> std::process::Output {
+        let mut cmd = Command::new("git");
+        if let Some(cwd) = cwd {
+            cmd.current_dir(cwd);
+        }
+        cmd.args(args);
+        cmd.output().await.expect("failed to spawn git")
+    }
+
+    /// 実際に生きたHTTPサーバーを`127.0.0.1`のエフェメラルポートで起動し、
+    /// テスト終了時に呼び出し側が`handle.abort()`できるようにする
+    /// (モックではなく本物の`git http-backend`橋渡し経路を通す)。
+    async fn spawn_real_server(state: AppState) -> (u16, tokio::task::JoinHandle<()>) {
+        let std_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let port = std_listener.local_addr().unwrap().port();
+        drop(std_listener);
+        let app = build_routes(state, "./static");
+        let addr = format!("127.0.0.1:{port}");
+        let handle = tokio::spawn(async move {
+            Server::new(TcpListener::bind(addr)).run(app).await.ok();
+        });
+        // サーバーがacceptを開始するまでの短い猶予(ポーリングではなく
+        // 固定の短いスリープ——このリポジトリの他のE2E検証と同水準)。
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        (port, handle)
+    }
+
+    /// 実際の`git clone`/`git push`コマンド(サブプロセス、モック無し)で
+    /// `<name>.wiki.git`へページを書き込み、別ディレクトリへの再cloneで
+    /// 中身が正しく取得できること、および`GET
+    /// /api/repos/:name/wiki`・`/wiki/:page`が同じ内容を返すことを確認する。
+    #[tokio::test]
+    async fn wiki_repo_git_clone_push_roundtrip() {
+        let state = make_state("wiki-roundtrip").await;
+        let repos_root = state.repos_root.clone();
+        let token = state.auth.create_session(ADMIN_EMAIL);
+        let basic = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, format!("{ADMIN_EMAIL}:{token}"));
+        let auth_header = format!("http.extraheader=Authorization: Basic {basic}");
+
+        // リポジトリ+Wikiを本物のAPI経由で作成。
+        {
+            let app = build_routes(state.clone(), "./static");
+            let client = TestClient::new(app);
+            let resp = client
+                .put("/repos/proj")
+                .header("Authorization", format!("Bearer {token}"))
+                .send()
+                .await;
+            resp.assert_status(poem::http::StatusCode::CREATED);
+        }
+        assert!(repos_root.join("proj.wiki.git").is_dir());
+
+        let (port, handle) = spawn_real_server(state).await;
+        let wiki_url = format!("http://127.0.0.1:{port}/proj.wiki.git");
+
+        let work_dir = std::env::temp_dir().join(format!("rgit-wiki-clone-{port}"));
+        let _ = tokio::fs::remove_dir_all(&work_dir).await;
+        tokio::fs::create_dir_all(&work_dir).await.unwrap();
+
+        // 1) clone(まだコミット無しの空リポジトリ)。
+        let clone_out = run_git(None, &["-c", &auth_header, "clone", &wiki_url, work_dir.to_str().unwrap()]).await;
+        assert!(clone_out.status.success(), "git clone failed: {}", String::from_utf8_lossy(&clone_out.stderr));
+
+        // 2) ページを追加してpush。**ローカルの現在のブランチ名**
+        // (clone直後、`init.defaultBranch`に従って決まる——`master`か
+        // `main`かは環境依存)へpushする。空リポジトリのbareリポジトリの
+        // `HEAD`シンボリック参照はこの同じ名前を既に指しているため、
+        // 別名(例えば固定で`main`)へpushすると、コミットが存在しない
+        // 側の名前をHEADが指したままになり、再clone時にワークツリーが
+        // 空になってしまう(実機検証で発見)。
+        let branch_out = run_git(Some(&work_dir), &["symbolic-ref", "--short", "HEAD"]).await;
+        assert!(branch_out.status.success(), "failed to read local default branch");
+        let local_branch = String::from_utf8_lossy(&branch_out.stdout).trim().to_string();
+
+        tokio::fs::write(work_dir.join("Home.md"), "# Welcome\n\nRGit Wiki roundtrip test.\n").await.unwrap();
+        let add_out = run_git(Some(&work_dir), &["add", "Home.md"]).await;
+        assert!(add_out.status.success());
+        let commit_out = run_git(
+            Some(&work_dir),
+            &["-c", "user.email=test@example.com", "-c", "user.name=RGit Test", "commit", "-m", "add Home page"],
+        )
+        .await;
+        assert!(commit_out.status.success(), "git commit failed: {}", String::from_utf8_lossy(&commit_out.stderr));
+        let push_out = run_git(Some(&work_dir), &["-c", &auth_header, "push", "origin", &format!("HEAD:refs/heads/{local_branch}")]).await;
+        assert!(push_out.status.success(), "git push failed: {}", String::from_utf8_lossy(&push_out.stderr));
+
+        // 3) 別ディレクトリへ再cloneし、実際にpushされた内容が取得できることを確認。
+        let reclone_dir = std::env::temp_dir().join(format!("rgit-wiki-reclone-{port}"));
+        let _ = tokio::fs::remove_dir_all(&reclone_dir).await;
+        let reclone_out = run_git(None, &["-c", &auth_header, "clone", &wiki_url, reclone_dir.to_str().unwrap()]).await;
+        assert!(reclone_out.status.success(), "git re-clone failed: {}", String::from_utf8_lossy(&reclone_out.stderr));
+        let recloned_content = tokio::fs::read_to_string(reclone_dir.join("Home.md")).await.unwrap();
+        assert!(recloned_content.contains("RGit Wiki roundtrip test."));
+
+        // 4) HTTP APIからも同じ内容が見えることを確認(GET /api/repos/:name/wiki, /wiki/:page)。
+        let list_resp = reqwest_like_get(port, "/api/repos/proj/wiki", Some(&token)).await;
+        assert!(list_resp.contains("Home.md"), "wiki page list should contain Home.md, got: {list_resp}");
+        let page_resp = reqwest_like_get(port, "/api/repos/proj/wiki/Home.md", Some(&token)).await;
+        assert!(page_resp.contains("RGit Wiki roundtrip test."), "wiki page content mismatch: {page_resp}");
+
+        handle.abort();
+        let _ = tokio::fs::remove_dir_all(&work_dir).await;
+        let _ = tokio::fs::remove_dir_all(&reclone_dir).await;
+    }
+
+    /// 追加の外部HTTPクレートを増やさないための、テスト専用の最小限GET
+    /// クライアント(生TCP + 手組みHTTP/1.1リクエスト)。本体側は
+    /// `poem`/`tokio`のみなので、テストコードもここでは標準ライブラリの
+    /// 範囲(`tokio::net::TcpStream`)で完結させる。
+    async fn reqwest_like_get(port: u16, path: &str, bearer: Option<&str>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.expect("connect");
+        let auth_line = bearer.map(|t| format!("Authorization: Bearer {t}\r\n")).unwrap_or_default();
+        let request = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n{auth_line}\r\n");
+        stream.write_all(request.as_bytes()).await.expect("write");
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).await.expect("read");
+        let text = String::from_utf8_lossy(&buf);
+        text.split("\r\n\r\n").nth(1).unwrap_or("").to_string()
+    }
+
+    /// Wikiのアクセス制御が本体リポジトリと**同じ**[`access::AccessConfig`]
+    /// を共有すること(独立の権限系統を持たないこと)を確認する:
+    /// private設定の本体リポジトリでは、Wiki一覧APIも(本体と同様)
+    /// 未ログインで403になり、本体を`public`+`allow_view`にすればWiki
+    /// 一覧も未ログインで見えるようになる。
+    #[tokio::test]
+    async fn wiki_access_control_mirrors_main_repo() {
+        let state = make_state("wiki-access").await;
+        let repos_root = state.repos_root.clone();
+        let token = state.auth.create_session(ADMIN_EMAIL);
+        let app = build_routes(state, "./static");
+        let client = TestClient::new(app);
+
+        let create_resp = client
+            .put("/repos/secret")
+            .header("Authorization", format!("Bearer {token}"))
+            .send()
+            .await;
+        create_resp.assert_status(poem::http::StatusCode::CREATED);
+
+        // private(既定)のままなら、未ログインでのWiki一覧取得は拒否される。
+        let anon_resp = client.get("/api/repos/secret/wiki").send().await;
+        anon_resp.assert_status(poem::http::StatusCode::FORBIDDEN);
+
+        // 本体リポジトリのアクセス設定をpublic+閲覧許可に変更する
+        // (Wiki専用の設定APIは存在しない——本体と共有という設計通り)。
+        let repo_path = repos_root.join("secret.git");
+        let config = access::AccessConfig { mode: access::Mode::Public, group: None, allow_view: true, allow_download: false, allow_push: false, accounts: std::collections::HashMap::new() };
+        access::save(&repo_path, &config).await.unwrap();
+
+        let anon_resp2 = client.get("/api/repos/secret/wiki").send().await;
+        anon_resp2.assert_status_is_ok();
+
+        // git smart HTTP側(push)も同じ設定を見る: pushは許可していないため
+        // 未認証pushへは401(WWW-Authenticate、gitクライアント再送仕様)になる。
+        let git_push_resp = client
+            .post("/secret.wiki.git/git-receive-pack")
+            .content_type("application/x-git-receive-pack-request")
+            .send()
+            .await;
+        git_push_resp.assert_status(poem::http::StatusCode::UNAUTHORIZED);
     }
 }

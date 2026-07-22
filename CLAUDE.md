@@ -4,13 +4,13 @@
 `CLAUDE.md`を正本とし、各プロジェクトへコピーして同期する方針に準じる。
 GitHubリポジトリ: [aon-co-jp/RGit](https://github.com/aon-co-jp/RGit)。
 
-> ⚠️ **正直な開示(最重要、2026-07-21更新)**: git smart HTTPプロトコル
+> ⚠️ **正直な開示(最重要、2026-07-22更新)**: git smart HTTPプロトコル
 > によるclone/push/fetch、OTPログイン(管理者+登録アカウント)、
 > リポジトリ単位のアクセス制御(private/public/group/アカウント個別、
-> 閲覧・ダウンロード・push個別許可)、自己申請フローまで実装済み。
-> Gitea/GitBucketが持つIssue・Pull Request・Wiki・Webhookはまだ無い。
-> Web UI側もログイン画面・アクセス許可設定画面はまだ無い(現状APIのみ、
-> `curl`での動作確認止まり)。`README.md`参照。
+> 閲覧・ダウンロード・push個別許可)、自己申請フロー、**Wiki**
+> (`<name>.wiki.git`という兄弟bareリポジトリ、閲覧はWeb UI、編集は
+> `git clone`/`git push`)まで実装済み。Gitea/GitBucketが持つ
+> Issue・Pull Request・Webhookはまだ無い。`README.md`参照。
 
 ## このプロジェクトの役割
 
@@ -437,6 +437,98 @@ CGIプログラム)をサブプロセスとして起動し、HTTPリクエスト
     (2) 実SMTP環境でのフルE2E(ログイン・申請承認・グループ管理含む)、
     (3) 保留中の外部バックアップ同期スクリプトへのRGit組み込み。
 ---
+
+- **2026-07-22 Wiki機能を実装(Gitea/GitBucketが持つ未実装4機能のうち
+  最も現実的だったもの)、実機・実git検証済み**:
+  1. **設計**: GitHub/GitLab/Gitea同様、各リポジトリ`<name>.git`の兄弟
+     として`<name>.wiki.git`という素のbareリポジトリを持つだけ
+     ——Wikiページの実体はそのリポジトリ内の`.md`ファイルであり、
+     Web版ページエディタは実装しない(このリポジトリ自体が通常の
+     リポジトリ向けにもWeb版ファイルエディタを持たないことと一貫
+     させた判断——「編集は`git clone`+`git push`」で正直に済ませる)。
+  2. **`src/main.rs`**: `wiki_dir_name(repo_dir_name)`
+     (`<name>.git`→`<name>.wiki.git`)、`access_config_dir`
+     (`git_get`/`git_post`のアクセス判定で、`<name>.wiki.git`への
+     リクエストも**本体`<name>.git`の[`access::AccessConfig`]を
+     そのまま見る**ようにマッピング——Wiki専用の権限系統は持たない、
+     という要件通り)。`GET /api/repos/:name/wiki`(ページ名一覧、
+     `git ls-tree`)・`GET /api/repos/:name/wiki/:page`(1ページの内容、
+     `git show`)を追加、既存のREADME表示(`get_readme`/`get_tree`)と
+     全く同じ「gitコマンドに任せる」方針を踏襲。**コミット0件の
+     Wikiリポジトリ(作成直後)でもエラーではなく空配列を返す**
+     (要件5対応——`git symbolic-ref --short HEAD`はコミットが無くても
+     成功する〈ブランチ名だけを返す〉ため、後続の`git ls-tree`失敗を
+     「まだページが無い」として飲み込む設計にした、実装中に気づいた罠)。
+  3. **`create_repo`(`PUT /repos/:name`)を拡張**: 本体bareリポジトリ
+     作成に続けて`<name>.wiki.git`も`git init --bare`で自動作成
+     (要件通り、「Wiki有効化」という別ステップ無しに`git clone
+     .../<name>.wiki.git`が最初から使える)。
+  4. **`list_repos`(`GET /api/repos`)を修正**: `<name>.wiki.git`
+     ディレクトリを一覧から除外(README表示等の対象ではないため、
+     管理者から見ても紛らわしいだけと判断——ブラウザ実機検証中に
+     `demo.wiki.git`が別リポジトリのように一覧に出てしまうのを発見して
+     追加した修正)。
+  5. **`web/src/wiki.rs`新設**(`web/src/lib.rs`に`mod wiki;`追加):
+     既存の`auth.rs`/`admin.rs`と同じ方針(`rust_json::parse_light`の
+     みでJSONパース、`serde`不使用)。リポジトリを選ぶと
+     `load_readme`と同時に`wiki::load_wiki_list`も走り、Wikiページ名の
+     一覧(`#wiki-list`)とページクリックでの内容表示
+     (`#wiki-content`、README同様Markdown→HTML変換)、および
+     `git clone`/`git push`での編集手順の案内(`#wiki-edit-instructions`)
+     を描画する。`static/index.html`に`#wiki-panel`セクションを追加。
+  6. **検証**:
+     - `cargo build`(サーバー)警告0件。
+     - `cargo test` **20件全green**(既存17件+今回追加3件: (a)
+       `create_repo_also_creates_wiki_sibling`——`PUT /repos/:name`が
+       `<name>.wiki.git`も作ること、および空Wikiの一覧APIが空配列を
+       返すことを確認、(b)
+       `wiki_repo_git_clone_push_roundtrip`——**実際に生きたHTTPサーバー
+       をエフェメラルポートで起動し、本物の`git clone`→ファイル追加→
+       `git commit`→`git push`(HTTP Basic認証、`http.extraheader`)→
+       別ディレクトリへの再`git clone`という一連を実サブプロセスで実行
+       し、pushした内容が正しく取得できること・`GET
+       /api/repos/:name/wiki`・`/wiki/:page`からも同じ内容が見えること
+       を確認**(モック無し)、(c)
+       `wiki_access_control_mirrors_main_repo`——本体リポジトリが
+       privateなら未ログインでのWiki一覧取得も403、本体を
+       `public`+`allow_view`に変えればWiki一覧も見えるようになること、
+       および`git-receive-pack`(push)側も未認証なら401
+       (`WWW-Authenticate`付き)になることを確認し、Wikiが独立の権限
+       系統を持たないことを実際のHTTPリクエストで裏付けた。
+       実装中に発見した罠2件: (i) `git -c "Authorization: ..."`という
+       構文は誤り(`git -c`はconfigキー=値の形式が必須)で
+       `-c http.extraheader=Authorization: Basic ...`が正しい、(ii)
+       pushを固定で`refs/heads/main`に向けると、空リポジトリのbareの
+       `HEAD`シンボリック参照が(環境の`init.defaultBranch`次第で)
+       `master`を指したままになり再clone時にワークツリーが空になる
+       ため、**cloneした側の実際のブランチ名
+       (`git symbolic-ref --short HEAD`)へpushする**よう修正した。
+     - `cargo build --target wasm32-unknown-unknown --release`
+       (`web/`)警告0件。`wasm-bindgen --target web --no-typescript
+       --out-dir static`でJSグルー再生成、`.wasm`は293KB
+       (旧289KBからWiki UI分増加)。生成物に`wiki-list`/`wiki-content`/
+       `wiki-edit-instructions`等の新規UI文字列が実際に埋め込まれている
+       ことをバイナリ内文字列grepで確認。
+     - **実機git検証(ローカル、curl+実git)**: サーバーを起動し、
+       `git init --bare`で`demo.git`/`demo.wiki.git`を作成→
+       `demo.git`を`public`+`allow_view`に設定→`demo.wiki.git`へ実際に
+       `git clone`→`Home.md`/`Setup.md`を追加して`git push`→
+       `GET /api/repos/demo/wiki`が`["Home.md","Setup.md"]`を返すことを
+       確認。
+     - **ブラウザ実機確認**: Claude Browser paneで`/ui/index.html`を
+       開き、コンソールエラー0件、新設の`#wiki-panel`
+       (「📚 Wiki」見出し・`#wiki-list`・`#wiki-content`)が正しく
+       描画されることを確認。**未検証・正直な開示**: このデプロイの
+       WASM側`fetch`は`auth::BASE_PATH="/rgit"`が固定でハードコード
+       されているため(既存の既知の制限、上記HANDOFF既出)、`/rgit`
+       マウント無しのローカル環境ではWikiページの実クリック→
+       実レンダリングまでは確認できなかった(README表示など既存機能も
+       同じ制限を受ける、今回のWiki実装固有の問題ではない)。本番
+       `runo.tokyo/rgit`環境でのみ意味を持つ制限のため、次回VPS上で
+       実クリック確認をすること。
+  - 次にすべきこと: (1) 本番`runo.tokyo/rgit`でのWikiページ実クリック
+    確認(上記未検証分)、(2) VPSへの再デプロイ(今回の変更を反映)、
+    (3) 保留中の外部バックアップ同期スクリプトへのRGit組み込み。
 
 ## エコシステム全体マップ(2026-07-21追記)
 

@@ -12,6 +12,13 @@
   a.repo-link { text-decoration: none; color: #0969da; cursor: pointer; }
   #status { color: #666; font-size: 0.9em; margin-bottom: 1rem; }
   #readme { border-left: 1px solid #ddd; padding-left: 1.5rem; flex: 1; }
+  #wiki-panel { border-left: 1px solid #ddd; padding-left: 1.5rem; flex: 1; margin-top: 1rem; }
+  #wiki-panel h2 { margin-top: 0; font-size: 1.05rem; }
+  #wiki-list { list-style: none; padding: 0; display: flex; gap: .75rem; flex-wrap: wrap; }
+  a.wiki-link { text-decoration: none; color: #0969da; cursor: pointer; }
+  #wiki-content { margin-top: .75rem; }
+  #wiki-edit-instructions { margin-top: .75rem; font-size: .85em; color: #555; }
+  #wiki-edit-instructions pre { background: #f6f8fa; border: 1px solid #ddd; border-radius: 6px; padding: .5rem .75rem; overflow-x: auto; }
   #auth-bar { display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap; margin-bottom: 1rem; padding: 0.5rem 0.75rem; background: #f6f8fa; border: 1px solid #ddd; border-radius: 6px; font-size: 0.9em; }
   #auth-bar input { padding: 0.2rem 0.4rem; }
   #auth-bar button { cursor: pointer; }
@@ -69,7 +76,15 @@
 <div id="status">起動中...</div>
 <div id="layout">
   <div id="sidebar"><ul id="repo-list"></ul></div>
-  <div id="readme"><p><em>左のリポジトリ名をクリックするとREADMEを表示します。</em></p></div>
+  <div>
+    <div id="readme"><p><em>左のリポジトリ名をクリックするとREADMEを表示します。</em></p></div>
+    <div id="wiki-panel">
+      <h2>📚 Wiki</h2>
+      <ul id="wiki-list"></ul>
+      <div id="wiki-content"><p><em>リポジトリを選ぶとWikiページ一覧が表示されます。</em></p></div>
+      <div id="wiki-edit-instructions"></div>
+    </div>
+  </div>
 </div>
 
 <div id="admin-panel" class="hidden">
