@@ -49,6 +49,7 @@ mod access;
 mod accounts;
 mod auth;
 mod capacity;
+mod issues;
 mod mail;
 
 use std::path::{Path, PathBuf};
@@ -549,6 +550,134 @@ async fn get_wiki_page(
         .status(poem::http::StatusCode::OK)
         .content_type("application/json")
         .body(serde_json::to_vec(&payload).unwrap_or_default()))
+}
+
+/// `GET /api/repos/:name/issues` — Issue一覧。Wikiと同じく、本体
+/// リポジトリの[`access::Need::View`]で権限判定する(Issue専用の権限
+/// 系統は持たない)。**シリアライズは[`rust_json::full`](RJSON/RS-JSON、
+/// `serde_json::Value`のこのエコシステム版ラッパー)を使う**——ユーザー
+/// 指示により、このリポジトリのHTTP層で`poem::web::Json`(内部で
+/// serde_jsonへ直結)を使わず、自前のJSONクレートに揃える。
+#[handler]
+async fn list_issues(req: &Request, PathExtractor(name): PathExtractor<String>, state: Data<&AppState>) -> PoemResult<Response> {
+    let repo_dir_name = sanitize_repo_name(&name)?;
+    let repo_path = state.repos_root.join(&repo_dir_name);
+    if !repo_path.exists() {
+        return Ok(Response::builder().status(poem::http::StatusCode::NOT_FOUND).body("repository not found"));
+    }
+    check_access(req, &state, &repo_path, access::Need::View).await?;
+
+    let issues = issues::list(&repo_path).await;
+    Ok(Response::builder()
+        .status(poem::http::StatusCode::OK)
+        .content_type("application/json")
+        .body(rust_json::full::to_vec_strict(&issues).unwrap_or_default()))
+}
+
+#[derive(serde::Deserialize)]
+struct CreateIssueRequest {
+    title: String,
+    body: String,
+}
+
+/// リクエストボディの生バイト列を読み取り、[`rust_json::full`]
+/// (RJSON/RS-JSON)経由でパースする。`poem::web::Json`抽出子は使わない
+/// (ユーザー指示、このエコシステム自前のJSONクレートへ統一するため)。
+async fn read_json_body<T: serde::de::DeserializeOwned>(body: poem::Body) -> PoemResult<T> {
+    let bytes = body.into_vec().await.map_err(|e| poem::Error::from_string(e.to_string(), poem::http::StatusCode::BAD_REQUEST))?;
+    rust_json::full::from_slice_strict(&bytes).map_err(|e| poem::Error::from_string(e.to_string(), poem::http::StatusCode::BAD_REQUEST))
+}
+
+/// `POST /api/repos/:name/issues` — Issue新規作成。作成には
+/// `access::Need::Push`(このリポジトリへの書き込み権)を要求する
+/// ——誰でも作れる掲示板にはしない、という判断(要件で明示されて
+/// いないため、既存の最も近い権限概念〈push〉を流用した)。
+#[handler]
+async fn create_issue(req: &Request, body: poem::Body, PathExtractor(name): PathExtractor<String>, state: Data<&AppState>) -> PoemResult<Response> {
+    let repo_dir_name = sanitize_repo_name(&name)?;
+    let repo_path = state.repos_root.join(&repo_dir_name);
+    if !repo_path.exists() {
+        return Ok(Response::builder().status(poem::http::StatusCode::NOT_FOUND).body("repository not found"));
+    }
+    check_access(req, &state, &repo_path, access::Need::Push).await?;
+    let body: CreateIssueRequest = read_json_body(body).await?;
+    if body.title.trim().is_empty() {
+        return Ok(Response::builder().status(poem::http::StatusCode::BAD_REQUEST).body("title must not be empty"));
+    }
+    let author = session_identity(req, &state).unwrap_or_else(|| "anonymous".to_string());
+    let issue = issues::create(&repo_path, body.title.clone(), body.body.clone(), author)
+        .await
+        .map_err(|e| poem::Error::from_string(e.to_string(), poem::http::StatusCode::INTERNAL_SERVER_ERROR))?;
+    Ok(Response::builder()
+        .status(poem::http::StatusCode::CREATED)
+        .content_type("application/json")
+        .body(rust_json::full::to_vec_strict(&issue).unwrap_or_default()))
+}
+
+#[handler]
+async fn get_issue(req: &Request, PathExtractor((name, id)): PathExtractor<(String, u64)>, state: Data<&AppState>) -> PoemResult<Response> {
+    let repo_dir_name = sanitize_repo_name(&name)?;
+    let repo_path = state.repos_root.join(&repo_dir_name);
+    if !repo_path.exists() {
+        return Ok(Response::builder().status(poem::http::StatusCode::NOT_FOUND).body("repository not found"));
+    }
+    check_access(req, &state, &repo_path, access::Need::View).await?;
+
+    match issues::get(&repo_path, id).await {
+        Some(issue) => Ok(Response::builder()
+            .status(poem::http::StatusCode::OK)
+            .content_type("application/json")
+            .body(rust_json::full::to_vec_strict(&issue).unwrap_or_default())),
+        None => Ok(Response::builder().status(poem::http::StatusCode::NOT_FOUND).body("issue not found")),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct SetIssueStatusRequest {
+    status: issues::IssueStatus,
+}
+
+#[handler]
+async fn set_issue_status(req: &Request, body: poem::Body, PathExtractor((name, id)): PathExtractor<(String, u64)>, state: Data<&AppState>) -> PoemResult<Response> {
+    let repo_dir_name = sanitize_repo_name(&name)?;
+    let repo_path = state.repos_root.join(&repo_dir_name);
+    if !repo_path.exists() {
+        return Ok(Response::builder().status(poem::http::StatusCode::NOT_FOUND).body("repository not found"));
+    }
+    check_access(req, &state, &repo_path, access::Need::Push).await?;
+    let body: SetIssueStatusRequest = read_json_body(body).await?;
+
+    match issues::set_status(&repo_path, id, body.status).await {
+        Ok(()) => Ok(Response::builder().status(poem::http::StatusCode::OK).content_type("application/json").body("{\"ok\":true}")),
+        Err(issues::SetStatusError::NotFound) => Ok(Response::builder().status(poem::http::StatusCode::NOT_FOUND).body("issue not found")),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct CreateCommentRequest {
+    body: String,
+}
+
+#[handler]
+async fn create_issue_comment(req: &Request, body: poem::Body, PathExtractor((name, id)): PathExtractor<(String, u64)>, state: Data<&AppState>) -> PoemResult<Response> {
+    let repo_dir_name = sanitize_repo_name(&name)?;
+    let repo_path = state.repos_root.join(&repo_dir_name);
+    if !repo_path.exists() {
+        return Ok(Response::builder().status(poem::http::StatusCode::NOT_FOUND).body("repository not found"));
+    }
+    check_access(req, &state, &repo_path, access::Need::Push).await?;
+    let body: CreateCommentRequest = read_json_body(body).await?;
+    if body.body.trim().is_empty() {
+        return Ok(Response::builder().status(poem::http::StatusCode::BAD_REQUEST).body("comment body must not be empty"));
+    }
+    let author = session_identity(req, &state).unwrap_or_else(|| "anonymous".to_string());
+    match issues::add_comment(&repo_path, id, author, body.body.clone()).await {
+        Some(comment) => Ok(Response::builder()
+            .status(poem::http::StatusCode::CREATED)
+            .content_type("application/json")
+            .body(rust_json::full::to_vec_strict(&comment).unwrap_or_default())),
+        None => Ok(Response::builder().status(poem::http::StatusCode::NOT_FOUND).body("issue not found")),
+    }
 }
 
 /// `GET /api/repos/:name/tree` — デフォルトブランチの全ファイル一覧
@@ -1282,6 +1411,9 @@ fn build_routes(state: AppState, static_dir: &str) -> impl poem::Endpoint {
         .at("/api/repos/:name/readme", get(get_readme))
         .at("/api/repos/:name/wiki", get(get_wiki_pages))
         .at("/api/repos/:name/wiki/:page", get(get_wiki_page))
+        .at("/api/repos/:name/issues", get(list_issues).post(create_issue))
+        .at("/api/repos/:name/issues/:id", get(get_issue).put(set_issue_status))
+        .at("/api/repos/:name/issues/:id/comments", post(create_issue_comment))
         .at("/api/repos/:name/access", get(get_access).put(set_access))
         .at("/api/repos/:name/tree", get(get_tree))
         .at("/api/repos/:name/zip", get(get_zip))
