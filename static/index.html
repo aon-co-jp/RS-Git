@@ -19,10 +19,32 @@
   #capacity-status { margin-left: auto; color: #666; }
   .hidden { display: none !important; }
   #auth-error { color: #b00; }
+  #intro { background: #f6f8fa; border: 1px solid #ddd; border-radius: 6px; padding: 1rem 1.25rem; margin-bottom: 1.25rem; }
+  #intro h2 { margin-top: 0; font-size: 1.05rem; }
+  #intro ul { margin: .5rem 0; padding-left: 1.3rem; }
+  #intro .downloads { display: flex; gap: .75rem; flex-wrap: wrap; margin-top: .75rem; }
+  #intro .downloads a { display: inline-block; text-decoration: none; background: #0969da; color: #fff; border-radius: 6px; padding: .4rem 1rem; font-size: .9em; }
+  #intro .note { color: #666; font-size: .85em; margin-top: .5rem; }
 </style>
 </head>
 <body>
 <h1>RGit</h1>
+<section id="intro">
+  <h2>RGitとは</h2>
+  <p>Gitea(Go言語製の自己ホスト型Git forge)が持つ機能のうち、まずgit clone/push・OTPメールログイン・
+  アクセス制御・README閲覧機能を実装した、Rust＋<a href="https://github.com/aon-co-jp/RPoem" target="_blank" rel="noopener">RPoem</a>版です。
+  元の機能を素直に移植しました。</p>
+  <ul>
+    <li>🔑 <strong>ログイン</strong>: 下の「メールアドレス」欄に入力→OTP送信→届いたコードを入力してログインします(管理者、または管理者が許可した登録アカウントのみ)。</li>
+    <li>📦 <strong>リポジトリ</strong>: 左のサイドバーから選ぶとREADMEを閲覧できます。<code>git clone</code>/<code>git push</code>も同じ権限でそのまま使えます。</li>
+    <li>🔐 <strong>アクセス制御</strong>: private/public/groupの3モード、アカウント単位で閲覧・ダウンロード・push権限を個別に設定可能(ログイン後、管理者は「管理」パネルから操作)。</li>
+  </ul>
+  <p class="note">⚠️ 正直な開示: v0.1.0時点ではGitea/GitBucketが持つWeb UI(diff整形表示等)・Issue・Pull Request・Wiki・Webhookは未実装です。</p>
+  <div class="downloads">
+    <a href="https://github.com/aon-co-jp/RGit/releases/latest" target="_blank" rel="noopener">⬇️ Linux/Windows インストーラー付きダウンロード(GitHub Releases)</a>
+    <a href="https://github.com/aon-co-jp/RGit" target="_blank" rel="noopener">📖 ソース・README(GitHub)</a>
+  </div>
+</section>
 <div id="auth-bar">
   <div id="auth-anon">
     <input id="login-email" type="email" placeholder="メールアドレス" size="24">
