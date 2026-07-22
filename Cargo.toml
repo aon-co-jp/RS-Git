@@ -28,3 +28,9 @@ rust-json = { path = "../RS-JSON", features = ["full"] }
 
 [dev-dependencies]
 tempfile = "3"
+open-runo-poem-compat = { path = "../RPoem/crates/open-runo-poem-compat" }
+open-runo-poem-compat-macro = { path = "../RPoem/crates/open-runo-poem-compat-macro" }
+hyper = "1.10"
+hyper-util = { version = "0.1", features = ["full"] }
+http-body-util = "0.1"
+bytes = "1.9"
